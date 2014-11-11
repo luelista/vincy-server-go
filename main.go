@@ -12,21 +12,38 @@ import (
 	"time"
 	"os/exec"
 	"max-weller/vincy-server-go/vncauth"
+	"flag"
+	"os"
+	"encoding/hex"
 )
 
-var configDir string = "./config"
+var configDirFlag = flag.String("config", "./config", "Path to configuration directory")
+var verboseLogs = flag.Bool("verbose", false, "Verbose")
+var listenPort = flag.Int("port", 44711, "Port number")
+var configDir string
 
 var onlineStatus map[string]string = make(map[string]string)
 
 func main() {
-	configDir = "/Users/mw/Projekte/node/vincy-server/config"
+	fmt.Println("vincy-server-go 0.0.5")
+	// configDir = "/Users/mw/Projekte/node/vincy-server/config"
+	flag.Parse()
+	configDir = *configDirFlag
+	
+	if _, err := os.Stat("./config/server-key.pem"); os.IsNotExist(err) {
+		fmt.Println("Key file 'config/server-key.pem' does not exist. Generating...")
+		GenerateRsaKeyAndCert("vincy-server", 4096, "", 10*365*24*time.Hour, false)
+		fmt.Println("Done")
+	}
 	
 	go pingChecker()
 	
 	cert, _ := tls.LoadX509KeyPair(configDir + "/server-cert.pem", configDir + "/server-key.pem")
 	config := tls.Config{Certificates: []tls.Certificate{cert}}
-	listener, err := tls.Listen("tcp", "127.0.0.1:8711", &config)
+	listento := fmt.Sprintf("0.0.0.0:%d", *listenPort)
+	listener, err := tls.Listen("tcp", listento, &config)
 	if err != nil { fmt.Printf("listen error: %s\n", err); return }
+	fmt.Println("Listening on ", listento)
 	
 	for {
 		//var conn tls.Conn
@@ -45,7 +62,7 @@ func main() {
 				}
 			}()
 			handleConnection(conn)
-			fmt.Println("handleConnection done")
+			if(*verboseLogs) { fmt.Println("handleConnection done") }
 		}()
 	}
 	
@@ -55,10 +72,10 @@ func handleConnection(c net.Conn) {
 	//fmt.Println("--- handleConnection -------------------------------")
 	
 	protocolGreet := readBytesBlock(c, 12)
-	fmt.Printf("greet: %s\n", string(protocolGreet))
+	if(*verboseLogs) { fmt.Printf("greet: %s\n", string(protocolGreet)) }
 
 	ua := readVbStr(c)
-	fmt.Printf("ua: %s\n", ua)
+	if(*verboseLogs) { fmt.Printf("ua: %s\n", ua) }
 	
 	c.Write([]byte("VINCY-SERVER"))
 	
@@ -82,7 +99,7 @@ func handleConnection(c net.Conn) {
 	
 	username, password := auth[0], auth[1]
 	
-	fmt.Println("Auth:",username,password)
+	if(*verboseLogs) { fmt.Println("Auth:",username,password) }
 	
 	hosts, err := readHostlist()
 	if err != nil {
@@ -102,6 +119,12 @@ func handleConnection(c net.Conn) {
 		break
 	case 0x02:
 		cmd_connectVnc(hosts, c, command_args)
+		break
+	case 0x03:
+		
+		break
+	case 0x04:
+		
 		break
 	default:
 		sendErrmes(c, "Not implemented")
@@ -137,20 +160,45 @@ func cmd_connectVnc(hosts HostList, c net.Conn, args string) {
 	client_prelude := readBytesBlock(c, 12)
 	target.Write(client_prelude)
 	
-	fmt.Println("- target:",string(target_prelude),"client:",string(client_prelude))
+	if(*verboseLogs) { fmt.Println("- target:",string(target_prelude),"client:",string(client_prelude)) }
 	
 	assert(string(client_prelude) == "RFB 003.008\n", "wrong client version")
 	assert(string(target_prelude) == "RFB 003.008\n", "wrong target version")
 	
-	// if version = 003.008
-	c.Write([]byte{0x01, 0x01})
-	sectype := readUint8(c)
-	assert(sectype == 1, "wrong sectype")
+	target_sectype := readSectypeFromServer(target)
+	target.Write([]byte{target_sectype})
 	
-	target_secTypeLen := readUint8(target)
-	target_secTypes := readBytesBlock(target, int(target_secTypeLen))
-	fmt.Println("- target secTypes:", target_secTypeLen, target_secTypes)
-	target.Write([]byte{0x02})
+	if (target_sectype == 16) {
+		// do TightVNC Authentication
+		tightauth_tunneling := int(readUint32(target))
+		tightauth_capCount := int(readUint32(target))
+		if (tightauth_tunneling != 0 || tightauth_capCount > 5) {
+			panic("tightauth invalid counts")
+		}
+		for i := 0; i < tightauth_capCount; i++ {
+			tightauth_cap := readBytesBlock(target,16)
+			fmt.Println("tightauth CAP: ",hex.Dump(tightauth_cap))
+		}
+		target.Write([]byte{0x00, 0x00, 0x00, 0x02})
+		
+		// if version = 003.008
+		c.Write([]byte{0x02, 0x01, 0x10})
+		// send client secTypes:  0x01 (None), 0x10 (TightVNC Auth)
+		
+		sectype := readUint8(c)
+		assert(sectype == 1 || sectype == 16, "wrong sectype")
+		
+		if sectype == 16 { c.Write([]byte{0,0,0,0,0,0,0,0}) }
+		
+	} else {
+		// if version = 003.008
+		c.Write([]byte{0x01, 0x01})
+		// send client secTypes:  0x01 (None)
+		
+		sectype := readUint8(c)
+		assert(sectype == 1, "wrong sectype")
+		
+	}
 	
 	challenge := readBytesBlock(target, 16)
 	target.Write(vncauth.VncAuthResponse(challenge, host.VNCPassword))
@@ -178,6 +226,18 @@ func cmd_connectVnc(hosts HostList, c net.Conn, args string) {
 	c.Close()
 }
 
+func readSectypeFromServer(target net.Conn) byte {
+	target_secTypeLen := readUint8(target)
+	target_secTypes := readBytesBlock(target, int(target_secTypeLen))
+	fmt.Println("- target secTypes:", target_secTypeLen, target_secTypes)
+	var useSectype byte = 0
+	for _, typ := range(target_secTypes) {
+		if (typ == 2 && useSectype == 0) { useSectype = 2 }
+		if (typ == 16) { useSectype = 16 }
+	}
+	return useSectype
+}
+
 func HostById(hosts HostList, id string) *HostInfo {
 	for _, host := range(hosts) {
 		if host.ID == id {
@@ -194,7 +254,7 @@ func assert(cond bool, err string) {
 // File helper
 var commentMatcher *regexp.Regexp
 func init() {
-	commentMatcher, _ = regexp.Compile("/^(#|\\/\\/)/")
+	commentMatcher, _ = regexp.Compile("^(#|\\/\\/)")
 }
 
 type UserInfo struct {
@@ -336,8 +396,7 @@ func pingChecker() {
 	for {
 		hosts, err := readHostlist()
 		if err != nil {
-			fmt.Println("Unable to read hostlist", err)
-			continue
+			panic(fmt.Sprintln("Unable to read hostlist", err))
 		}
 		
 		for _, host := range(hosts) {
